@@ -3,6 +3,7 @@ import json
 import faiss
 import logging
 import pandas as pd
+import numpy as np
 import mysql.connector
 from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Configuration for MySQL
 MYSQL_HOST = 'localhost'
 MYSQL_USER = 'root'
+MYSQL_PORT=5435
 MYSQL_PASSWORD = '1234'
 MYSQL_DATABASE = 'task1'
 
@@ -106,6 +108,7 @@ def connect_to_mysql():
         connection = mysql.connector.connect(
             host=MYSQL_HOST,
             user=MYSQL_USER,
+            port=MYSQL_PORT,
             password=MYSQL_PASSWORD,
             database=MYSQL_DATABASE
         )
@@ -200,7 +203,7 @@ async def query(request: QueryRequest):
     try:
         # Search in FAISS index
         query_embedding = model.encode([prompt])
-        distances, indices = index.search(query_embedding, k=5)
+        distances, indices = index.search(query_embedding, k=10)
 
         results = []
         for dist, idx in zip(distances[0], indices[0]):
@@ -213,13 +216,12 @@ async def query(request: QueryRequest):
                     "metadata": result_metadata
                 })
 
+        if not results:
+            return {"response": "No data found for the given query."}
 
-        # Convert results to natural language
-        response = convert_to_natural_language(
-            [result["data"] for result in results],
-            natural_language_text=prompt
-        )
-
+        # Convert results to natural language response
+        relevant_data = [res["data"] for res in results]
+        response = convert_to_natural_language(relevant_data, prompt)
         return {"response": response}
     except Exception as e:
         logger.error(f"Error processing query: {e}")
@@ -228,19 +230,74 @@ async def query(request: QueryRequest):
 @app.post("/upload-file/")
 async def upload_file(file: UploadFile = File(...)):
     try:
+        # Save the uploaded file
         file_location = os.path.join(UPLOADS_DIR, file.filename)
-        with open(file_location, "wb+") as file_object:
-            file_object.write(file.file.read())
-        
-        # Process and index the new file
-        new_file_data = fetch_from_files(UPLOADS_DIR)
-        process_and_index_data(new_file_data)
+        with open(file_location, "wb") as f:
+            f.write(file.file.read())
 
-        return {"info": f"file '{file.filename}' uploaded successfully"}
+        # Process and index the uploaded file data
+        file_data = fetch_from_files(UPLOADS_DIR)
+        process_and_index_data(file_data)
+
+        return {"info": f"File '{file.filename}' uploaded and indexed successfully"}
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail="Error uploading file")
 
-# Run the application
+@app.get("/list-files/")
+async def list_files():
+    try:
+        files = os.listdir(UPLOADS_DIR)
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        raise HTTPException(status_code=500, detail="Error listing files")
+
+@app.delete("/delete-file/{filename}")
+async def delete_file(filename: str):
+    try:
+        global document_store, metadata_store
+
+        # Debugging: Print metadata store contents
+        logger.debug(f"Metadata store contents: {metadata_store}")
+
+        # Find and remove embeddings associated with the file
+        file_metadata_prefix = f"File: {filename}"
+        indices_to_remove = [i for i, metadata in enumerate(metadata_store) if metadata == file_metadata_prefix]
+
+        # Debugging: Print indices to remove
+        logger.debug(f"Indices to remove for '{file_metadata_prefix}': {indices_to_remove}")
+
+        if not indices_to_remove:
+            raise HTTPException(status_code=404, detail="File data not found in index")
+
+        # Collect the embeddings to be removed from the index
+        indices_to_remove.sort(reverse=True)  # Remove from the end to avoid index shifting
+        for idx in indices_to_remove:
+            embedding_to_remove = model.encode([document_store[idx]])
+            if embedding_to_remove.ndim == 2:
+                index.remove_ids(np.array([idx], dtype=np.int64))
+            else:
+                raise HTTPException(status_code=500, detail="Invalid embedding dimension")
+
+            document_store.pop(idx)
+            metadata_store.pop(idx)
+
+        logger.info(f"Data associated with '{filename}' removed from FAISS index.")
+
+        # Remove file from the upload directory
+        file_path = os.path.join(UPLOADS_DIR, filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+            logger.info(f"File '{filename}' removed from the upload directory.")
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return {"info": f"File '{filename}' and its data removed successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting file: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting file")
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
