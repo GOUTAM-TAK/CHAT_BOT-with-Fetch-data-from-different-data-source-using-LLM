@@ -35,13 +35,16 @@ logger = logging.getLogger(__name__)
 # Configuration for MySQL
 MYSQL_HOST = 'localhost'
 MYSQL_USER = 'root'
-MYSQL_PORT=5435
+MYSQL_PORT = 5435
 MYSQL_PASSWORD = '1234'
 MYSQL_DATABASE = 'task1'
 
-# Directory for file uploads
+# Directory for file uploads and FAISS index
 UPLOADS_DIR = 'upload_files'
+INDEX_DIR = 'faiss_index'
+INDEX_FILE = os.path.join(INDEX_DIR, 'faiss_index.bin')
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
 
 # Initialize the FAISS index
 model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -183,16 +186,28 @@ def process_and_index_data(data):
                 document_store.append(chunk)
                 metadata_store.append(d["source"])
 
-        logger.info("Data indexed successfully in FAISS index.")
+        # Save the index to disk
+        faiss.write_index(index, INDEX_FILE)
+        logger.info("Data indexed successfully in FAISS index and saved to disk.")
     except Exception as e:
         logger.error(f"Error processing and indexing data: {e}")
         raise HTTPException(status_code=500, detail="Error processing and indexing data")
 
+# Load the FAISS index from disk
+def load_faiss_index():
+    global index, document_store, metadata_store
+    if os.path.exists(INDEX_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        logger.info("FAISS index loaded from disk.")
+    else:
+        logger.info("FAISS index not found on disk. Creating a new index.")
+        mysql_data = fetch_all_tables_data()
+        process_and_index_data(mysql_data)
+        file_data = fetch_from_files(UPLOADS_DIR)
+        process_and_index_data(file_data)
+
 # Initial data fetching and indexing
-mysql_data = fetch_all_tables_data()
-process_and_index_data(mysql_data)
-file_data = fetch_from_files(UPLOADS_DIR)
-process_and_index_data(file_data)
+load_faiss_index()
 
 class QueryRequest(BaseModel):
     prompt: str
@@ -227,6 +242,15 @@ async def query(request: QueryRequest):
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail="Error processing query")
 
+@app.get("/list-files/")
+async def list_files():
+    try:
+        files = os.listdir(UPLOADS_DIR)
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        raise HTTPException(status_code=500, detail="Error listing files")
+
 @app.post("/upload-file/")
 async def upload_file(file: UploadFile = File(...)):
     try:
@@ -244,60 +268,48 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail="Error uploading file")
 
-@app.get("/list-files/")
-async def list_files():
-    try:
-        files = os.listdir(UPLOADS_DIR)
-        return {"files": files}
-    except Exception as e:
-        logger.error(f"Error listing files: {e}")
-        raise HTTPException(status_code=500, detail="Error listing files")
-
 @app.delete("/delete-file/{filename}")
 async def delete_file(filename: str):
     try:
-        global document_store, metadata_store
-
-        # Debugging: Print metadata store contents
-        logger.debug(f"Metadata store contents: {metadata_store}")
-
-        # Find and remove embeddings associated with the file
-        file_metadata_prefix = f"File: {filename}"
-        indices_to_remove = [i for i, metadata in enumerate(metadata_store) if metadata == file_metadata_prefix]
-
-        # Debugging: Print indices to remove
-        logger.debug(f"Indices to remove for '{file_metadata_prefix}': {indices_to_remove}")
-
-        if not indices_to_remove:
-            raise HTTPException(status_code=404, detail="File data not found in index")
-
-        # Collect the embeddings to be removed from the index
-        indices_to_remove.sort(reverse=True)  # Remove from the end to avoid index shifting
-        for idx in indices_to_remove:
-            embedding_to_remove = model.encode([document_store[idx]])
-            if embedding_to_remove.ndim == 2:
-                index.remove_ids(np.array([idx], dtype=np.int64))
-            else:
-                raise HTTPException(status_code=500, detail="Invalid embedding dimension")
-
-            document_store.pop(idx)
-            metadata_store.pop(idx)
-
-        logger.info(f"Data associated with '{filename}' removed from FAISS index.")
-
-        # Remove file from the upload directory
         file_path = os.path.join(UPLOADS_DIR, filename)
-        if os.path.isfile(file_path):
+        if os.path.exists(file_path):
             os.remove(file_path)
-            logger.info(f"File '{filename}' removed from the upload directory.")
+
+            # Clear existing index and metadata stores
+            global index, document_store, metadata_store
+            index = faiss.IndexFlatL2(dimension)
+            document_store.clear()
+            metadata_store.clear()
+
+            # Rebuild the index from remaining files
+            file_data = fetch_from_files(UPLOADS_DIR)
+            process_and_index_data(file_data)
+
+            return {"info": f"File '{filename}' deleted and FAISS index updated successfully"}
         else:
             raise HTTPException(status_code=404, detail="File not found")
-
-        return {"info": f"File '{filename}' and its data removed successfully"}
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
         raise HTTPException(status_code=500, detail="Error deleting file")
 
+@app.post("/update-index/")
+async def update_index():
+    try:
+        global index, document_store, metadata_store
+        index = faiss.IndexFlatL2(dimension)
+        document_store.clear()
+        metadata_store.clear()
+
+        # Fetch and index data from MySQL and files
+        mysql_data = fetch_all_tables_data()
+        process_and_index_data(mysql_data)
+        file_data = fetch_from_files(UPLOADS_DIR)
+        process_and_index_data(file_data)
+
+        return {"info": "FAISS index updated successfully with data from MySQL and files"}
+    except Exception as e:
+        logger.error(f"Error updating FAISS index: {e}")
+        raise HTTPException(status_code=500, detail="Error updating FAISS index")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
