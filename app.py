@@ -1,20 +1,21 @@
 import os
-import json
-import faiss
 import logging
-import pandas as pd
-import numpy as np
-import mysql.connector
-from sentence_transformers import SentenceTransformer
+import json
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import uvicorn
 from pydantic import BaseModel
 from typing import List
 from datetime import date, datetime
+import mysql.connector
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+import traceback
+import numpy as np
 
 # Initialize the FastAPI app
 app = FastAPI()
@@ -32,43 +33,27 @@ app.add_middleware(
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Configuration for MySQL
-MYSQL_HOST = 'localhost'
-MYSQL_USER = 'root'
-MYSQL_PORT = 5435
-MYSQL_PASSWORD = '1234'
-MYSQL_DATABASE = 'task1'
+# Pinecone initialization
+pinecone_api_key = 'b807b048-2024-47bd-b4d5-c94e5f982ec0'
+pinecone = Pinecone(api_key=pinecone_api_key)
 
-# Directory for file uploads and FAISS index
+index_name = "training-project-vectordb"
+dimension = 384  # Update this with the dimensionality of your embeddings
+
+# Directory for file uploads
 UPLOADS_DIR = 'upload_files'
-INDEX_DIR = 'faiss_index'
-INDEX_FILE = os.path.join(INDEX_DIR, 'faiss_index.bin')
 os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(INDEX_DIR, exist_ok=True)
 
-# Initialize the FAISS index
-model = SentenceTransformer('all-MiniLM-L6-v2')
-dimension = model.get_sentence_embedding_dimension()
-index = faiss.IndexFlatL2(dimension)
-
-# Stores for document data and metadata
+# Initialize global stores
 document_store = []
 metadata_store = []
 
 # Initialize the language model
-openai_api_key = os.getenv('OPENAI_API_KEY')
+openai_api_key = os.getenv('OPENAI_API_KEY', 'your-openai-api-key')
 llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key=openai_api_key)
 
-# Custom JSON serializer for objects not serializable by default JSON encoder
-def json_serialize(obj):
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    raise TypeError(f"Type {type(obj)} not serializable")
-
-# Token counting utility
-def count_tokens(text: str) -> int:
-    # Placeholder for token counting logic
-    return len(text.split())
+# Load the Sentence Transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Convert query results and user queries into natural language responses
 def convert_to_natural_language(data: List[str], natural_language_text: str) -> str:
@@ -88,7 +73,8 @@ def convert_to_natural_language(data: List[str], natural_language_text: str) -> 
         - Review the query results and determine if they are relevant to the given prompt.
         - If the data is relevant, generate a coherent natural language response based on only the provided results.
         - If the data is not relevant or if no relevant data is found, respond with: "No information available, please provide a correct prompt."
-
+        - Not add any additional information in response.
+        
         Please provide a response in natural language based on these instructions.
         """
 
@@ -109,11 +95,11 @@ def convert_to_natural_language(data: List[str], natural_language_text: str) -> 
 def connect_to_mysql():
     try:
         connection = mysql.connector.connect(
-            host=MYSQL_HOST,
-            user=MYSQL_USER,
-            port=MYSQL_PORT,
-            password=MYSQL_PASSWORD,
-            database=MYSQL_DATABASE
+            host='localhost',
+            user='root',
+            port=5435,
+            password='1234',
+            database='task1'
         )
         return connection
     except mysql.connector.Error as err:
@@ -179,137 +165,158 @@ def process_and_index_data(data):
             for chunk in chunks:
                 embeddings = model.encode([chunk])
                 if embeddings.shape[0] == 0:
-                    logger.warning("No embeddings to add to FAISS.")
+                    logger.warning("No embeddings to add to Pinecone.")
                     continue
 
-                index.add(embeddings)
+                # Use upsert to add embeddings to Pinecone
+                pinecone.Index(index_name).upsert(vectors=[{"id": str(len(document_store)), "values": embeddings[0].tolist()}])
                 document_store.append(chunk)
                 metadata_store.append(d["source"])
 
-        # Save the index to disk
-        faiss.write_index(index, INDEX_FILE)
-        logger.info("Data indexed successfully in FAISS index and saved to disk.")
+        logger.info("Data indexed successfully in Pinecone.")
     except Exception as e:
         logger.error(f"Error processing and indexing data: {e}")
         raise HTTPException(status_code=500, detail="Error processing and indexing data")
 
-# Load the FAISS index from disk
-def load_faiss_index():
-    global index, document_store, metadata_store
-    if os.path.exists(INDEX_FILE):
-        index = faiss.read_index(INDEX_FILE)
-        logger.info("FAISS index loaded from disk.")
-    else:
-        logger.info("FAISS index not found on disk. Creating a new index.")
-        mysql_data = fetch_all_tables_data()
-        process_and_index_data(mysql_data)
-        file_data = fetch_from_files(UPLOADS_DIR)
-        process_and_index_data(file_data)
+# Define custom JSON serializer for objects not serializable by default JSON encoder
+def json_serialize(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
 
-# Initial data fetching and indexing
-load_faiss_index()
-
-class QueryRequest(BaseModel):
-    prompt: str
-
-@app.post("/query")
-async def query(request: QueryRequest):
-    prompt = request.prompt
+def initialize_index():
     try:
-        # Search in FAISS index
-        query_embedding = model.encode([prompt])
-        distances, indices = index.search(query_embedding, k=10)
+        # Check if the index already exists
+        if index_name not in pinecone.list_indexes().names():
+            # Define the serverless specification
+            spec = ServerlessSpec(region="us-east1-gcp", cloud="aws")
 
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx >= 0 and idx < len(document_store):
-                result_data = document_store[idx]
-                result_metadata = metadata_store[idx]
-                results.append({
-                    "distance": dist,
-                    "data": result_data,
-                    "metadata": result_metadata
-                })
-
-        if not results:
-            return {"response": "No data found for the given query."}
-
-        # Convert results to natural language response
-        relevant_data = [res["data"] for res in results]
-        response = convert_to_natural_language(relevant_data, prompt)
-        return {"response": response}
+            # Create the index with the specified parameters
+            pinecone.create_index(
+                name=index_name,
+                dimension=384,
+                metric="cosine",
+                spec=spec
+            )
+            print("Index created successfully.")
     except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        raise HTTPException(status_code=500, detail="Error processing query")
+        print(f"Error initializing Pinecone index: {e}")
+        traceback.print_exc()  # Print stack trace for detailed error information
+        raise HTTPException(status_code=500, detail="Error initializing Pinecone index")
 
-@app.get("/list-files/")
-async def list_files():
-    try:
-        files = os.listdir(UPLOADS_DIR)
-        return {"files": files}
-    except Exception as e:
-        logger.error(f"Error listing files: {e}")
-        raise HTTPException(status_code=500, detail="Error listing files")
+# Define request and response models
+class SearchQuery(BaseModel):
+    query: str
 
-@app.post("/upload-file/")
+class FileUploadResponse(BaseModel):
+    filename: str
+
+@app.post("/uploadfile/", response_model=FileUploadResponse)
 async def upload_file(file: UploadFile = File(...)):
     try:
-        # Save the uploaded file
-        file_location = os.path.join(UPLOADS_DIR, file.filename)
-        with open(file_location, "wb") as f:
-            f.write(file.file.read())
+        file_path = os.path.join(UPLOADS_DIR, file.filename)
+        with open(file_path, "wb") as buffer:
+            buffer.write(file.file.read())
 
-        # Process and index the uploaded file data
-        file_data = fetch_from_files(UPLOADS_DIR)
-        process_and_index_data(file_data)
+        # Process and index the uploaded file
+        data = fetch_from_files(UPLOADS_DIR)
+        process_and_index_data(data)
 
-        return {"info": f"File '{file.filename}' uploaded and indexed successfully"}
+        return {"filename": file.filename}
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail="Error uploading file")
 
-@app.delete("/delete-file/{filename}")
+@app.post("/deletefile/")
 async def delete_file(filename: str):
     try:
         file_path = os.path.join(UPLOADS_DIR, filename)
         if os.path.exists(file_path):
             os.remove(file_path)
 
-            # Clear existing index and metadata stores
-            global index, document_store, metadata_store
-            index = faiss.IndexFlatL2(dimension)
-            document_store.clear()
-            metadata_store.clear()
+            # Remove the file data from Pinecone
+            index = pinecone.Index(index_name)
+            index.delete(ids=[filename])
 
-            # Rebuild the index from remaining files
+            # Process and reindex remaining files
+            remaining_files = os.listdir(UPLOADS_DIR)
             file_data = fetch_from_files(UPLOADS_DIR)
             process_and_index_data(file_data)
 
-            return {"info": f"File '{filename}' deleted and FAISS index updated successfully"}
+            return {"status": "success", "filename": filename}
         else:
             raise HTTPException(status_code=404, detail="File not found")
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
         raise HTTPException(status_code=500, detail="Error deleting file")
 
-@app.post("/update-index/")
-async def update_index():
+def fetch_query_vector(query):
     try:
-        global index, document_store, metadata_store
-        index = faiss.IndexFlatL2(dimension)
-        document_store.clear()
-        metadata_store.clear()
-
-        # Fetch and index data from MySQL and files
-        mysql_data = fetch_all_tables_data()
-        process_and_index_data(mysql_data)
-        file_data = fetch_from_files(UPLOADS_DIR)
-        process_and_index_data(file_data)
-
-        return {"info": "FAISS index updated successfully with data from MySQL and files"}
+        query_vector = model.encode([query])
+        return query_vector[0]
     except Exception as e:
-        logger.error(f"Error updating FAISS index: {e}")
-        raise HTTPException(status_code=500, detail="Error updating FAISS index")
+        logger.error(f"Error encoding query: {e}")
+        raise HTTPException(status_code=500, detail="Error encoding query")
+
+logger = logging.getLogger(__name__)
+
+@app.post("/query/")
+async def query_data(search_query: SearchQuery):
+    try:
+        query_text = search_query.query
+        query_vector = fetch_query_vector(query_text)
+
+        # Ensure query_vector is in the correct format (flat list of floats)
+        query_vector = query_vector.tolist()
+        print("query vector is : ", query_vector)
+
+        # Fetch relevant documents from Pinecone
+        index = pinecone.Index(index_name)
+        search_response = index.query(
+            vector=query_vector,
+            top_k=3,
+            include_values=True
+        )
+        print("search response is : ", search_response)
+
+        if 'matches' not in search_response or not search_response['matches']:
+            logger.warning("No matches found.")
+            return "No information available, please provide a correct prompt."
+
+        matches = search_response['matches']
+        
+        # Ensure document_store is defined and accessible
+        if not hasattr(document_store, '__len__'):
+            logger.error("document_store is not defined or does not support length.")
+            raise HTTPException(status_code=500, detail="Document store is not available.")
+        
+        # Validate indices and fetch documents
+        data = []
+        for match in matches:
+            if 'id' in match:
+                id = int(match['id'])
+                if 0 <= id < len(document_store):
+                    data.append(document_store[id])
+                else:
+                    logger.warning(f"Index {id} is out of range for document_store.")
+            else:
+                logger.warning(f"No 'id' field in match: {match}")
+
+        if not data:
+            return "No information available, please provide a correct prompt."
+
+        return convert_to_natural_language(data, query_text)
+
+    except Exception as e:
+        logger.error(f"Error querying data: {e}")
+        traceback.print_exc()  # Print stack trace for detailed error information
+        raise HTTPException(status_code=500, detail="Error querying data")
+
+@app.on_event("startup")
+async def startup_event():
+    initialize_index()
+    file_data = fetch_from_files(UPLOADS_DIR)
+    process_and_index_data(file_data)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
