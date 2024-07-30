@@ -16,6 +16,7 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 import traceback
 import numpy as np
+from transformers import pipeline
 
 # Initialize the FastAPI app
 app = FastAPI()
@@ -43,6 +44,9 @@ dimension = 384  # Update this with the dimensionality of your embeddings
 # Directory for file uploads
 UPLOADS_DIR = 'upload_files'
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# Declare global variables
+global document_store, metadata_store
 
 # Initialize global stores
 document_store = []
@@ -226,26 +230,45 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail="Error uploading file")
+    
+# Define a model for the delete request
+class DeleteFileRequest(BaseModel):
+    filename: str
 
-@app.post("/deletefile/")
+@app.delete("/deletefile/{filename}")
 async def delete_file(filename: str):
     try:
         file_path = os.path.join(UPLOADS_DIR, filename)
         if os.path.exists(file_path):
             os.remove(file_path)
 
-            # Remove the file data from Pinecone
-            index = pinecone.Index(index_name)
-            index.delete(ids=[filename])
+            # Declare global variables
+            global document_store, metadata_store
 
-            # Process and reindex remaining files
-            remaining_files = os.listdir(UPLOADS_DIR)
-            file_data = fetch_from_files(UPLOADS_DIR)
-            process_and_index_data(file_data)
+            # Log current state for debugging
+            logger.info(f"Initial document_store: {document_store}")
+            logger.info(f"Initial metadata_store: {metadata_store}")
 
-            return {"status": "success", "filename": filename}
+            # Identify IDs to delete from Pinecone
+            ids_to_delete = [str(i) for i, source in enumerate(metadata_store) if f"File: {filename}" in source]
+            logger.info(f"IDs to delete: {ids_to_delete}")
+
+            # Remove related data from Pinecone index
+            if ids_to_delete:
+                index = pinecone.Index(index_name)
+                index.delete(ids=ids_to_delete)
+
+            # Update document and metadata stores
+            document_store = [doc for doc, source in zip(document_store, metadata_store) if f"File: {filename}" not in source]
+            metadata_store = [source for source in metadata_store if f"File: {filename}" not in source]
+
+            # Log updated state for debugging
+            logger.info(f"Updated document_store: {document_store}")
+            logger.info(f"Updated metadata_store: {metadata_store}")
+
+            return {"status": "success", "message": "File deleted successfully"}
         else:
-            raise HTTPException(status_code=404, detail="File not found")
+            return {"status": "error", "message": "File not found"}
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
         raise HTTPException(status_code=500, detail="Error deleting file")
@@ -274,7 +297,7 @@ async def query_data(search_query: SearchQuery):
         index = pinecone.Index(index_name)
         search_response = index.query(
             vector=query_vector,
-            top_k=3,
+            top_k=35,
             include_values=True
         )
         print("search response is : ", search_response)
@@ -317,6 +340,8 @@ async def startup_event():
     initialize_index()
     file_data = fetch_from_files(UPLOADS_DIR)
     process_and_index_data(file_data)
+    mysql_data = fetch_all_tables_data()
+    process_and_index_data(mysql_data)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8004)
